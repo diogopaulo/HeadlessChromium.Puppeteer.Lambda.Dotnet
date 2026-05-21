@@ -1,10 +1,12 @@
 ﻿using Microsoft.Extensions.Logging;
 using Mono.Unix;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
-using HeadlessChromium.Puppeteer.Lambda.Dotnet.Tar;
 using System.Linq;
+using System.Reflection;
+using HeadlessChromium.Puppeteer.Lambda.Dotnet.Tar;
 
 namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
 {
@@ -15,7 +17,7 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
         private static string LdLibEnvVariable = "LD_LIBRARY_PATH";
         private static string LdLibValue = "/tmp/lib";
 
-        public static string ChromiumPath = "/tmp/chromium";
+        private readonly string _chromiumPath;
 
         private static readonly object SyncObject = new object();
         private readonly ILogger<ChromiumExtractor> logger;
@@ -57,6 +59,13 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
         {
             this.loggerFactory = loggerFactory;
             logger = loggerFactory.CreateLogger<ChromiumExtractor>();
+            _chromiumPath = ResolveChromiumPath();
+        }
+
+        private string ResolveChromiumPath()
+        {
+            var envPath = Environment.GetEnvironmentVariable("CHROMIUM_PATH");
+            return !string.IsNullOrEmpty(envPath) ? envPath : "/tmp/chromium";
         }
 
         /// <summary>
@@ -72,38 +81,50 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
                 logger.LogDebug("/tmp doesn't exist.  Is this running on lambda?");
             }
 
-            // Quick bale if exec exists
-            if (File.Exists(ChromiumPath))
+            if (File.Exists(_chromiumPath))
             {
-                return ChromiumPath;
+                try
+                {
+                    ValidateBinary(_chromiumPath);
+                    return _chromiumPath;
+                }
+                catch (ChromiumExtractionException ex)
+                {
+                    logger.LogWarning(
+                        "Cached Chromium binary failed validation ({Message}). Re-extracting.",
+                        ex.Message);
+                    File.Delete(_chromiumPath);
+                }
             }
 
             logger.LogDebug("Chromium doesn't exist, extracting");
 
             lock (SyncObject)
             {
-                if (!File.Exists(ChromiumPath))
+                if (!File.Exists(_chromiumPath))
                 {
+                    var sourceDirectory = FindSourceDirectory();
+
                     if (!string.IsNullOrEmpty(AwsOperatingSystem))
                     {
-                        ExtractDependencies($"{AwsOperatingSystem}.tar.br", "/tmp");
+                        ExtractDependencies($"{AwsOperatingSystem}.tar.br", "/tmp", sourceDirectory);
                     }
                     else
                     {
                         logger.LogWarning("Operating environment unexpected. Unable to extract correct dependencies.");
                     }
 
-                    ExtractDependencies("fonts.tar.br", "/tmp");
-                    ExtractDependencies("swiftshader.tar.br", "/tmp");
+                    ExtractDependencies("fonts.tar.br", "/tmp", sourceDirectory);
+                    ExtractDependencies("swiftshader.tar.br", "/tmp", sourceDirectory);
 
-                    var compressedFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "chromium.br");
+                    var compressedFile = Path.Combine(sourceDirectory, "chromium.br");
 
                     logger.LogDebug($"Found compressed file {compressedFile}");
 
-                    using (var writeFile = File.OpenWrite(ChromiumPath))
+                    using (var writeFile = File.OpenWrite(_chromiumPath))
                     using (var readFile = File.OpenRead(compressedFile))
                     {
-                        logger.LogDebug($"Extracting chromium to {ChromiumPath}");
+                        logger.LogDebug($"Extracting chromium to {_chromiumPath}");
 
                         using (var bs = new BrotliStream(readFile, CompressionMode.Decompress))
                         {
@@ -111,16 +132,61 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
                             bs.Dispose();
                         }
 
-                        var fileInfo = new UnixFileInfo(ChromiumPath);
+                        var fileInfo = new UnixFileInfo(_chromiumPath);
                         fileInfo.FileAccessPermissions = FileAccessPermissions.UserReadWriteExecute |
                                                          FileAccessPermissions.GroupReadWriteExecute;
                     }
 
-                    logger.LogInformation("Extracted chromium to {ChromiumPath}", ChromiumPath);
+                    ValidateBinary(_chromiumPath);
+                    logger.LogInformation("Extracted chromium to {ChromiumPath}", _chromiumPath);
                 }
             }
 
-            return ChromiumPath;
+            return _chromiumPath;
+        }
+
+        private void ValidateBinary(string path)
+        {
+            if (!File.Exists(path))
+                throw new ChromiumExtractionException(
+                    $"Chromium binary not found after extraction: {path}");
+
+            if (new FileInfo(path).Length == 0)
+                throw new ChromiumExtractionException(
+                    $"Chromium binary is empty (0 bytes): {path}");
+
+            if (!new UnixFileInfo(path).FileAccessPermissions
+                    .HasFlag(FileAccessPermissions.UserExecute))
+                throw new ChromiumExtractionException(
+                    $"Chromium binary is not executable: {path}");
+        }
+
+        private string FindSourceDirectory()
+        {
+            var candidates = new List<string>();
+
+            var envDir = Environment.GetEnvironmentVariable("CHROMIUM_BIN_PATH");
+            if (!string.IsNullOrEmpty(envDir)) candidates.Add(envDir);
+
+            candidates.Add(AppDomain.CurrentDomain.BaseDirectory);
+
+            var execAsm = Assembly.GetExecutingAssembly().Location;
+            if (!string.IsNullOrEmpty(execAsm))
+                candidates.Add(Path.GetDirectoryName(execAsm));
+
+            var entryAsm = Assembly.GetEntryAssembly()?.Location;
+            if (!string.IsNullOrEmpty(entryAsm))
+                candidates.Add(Path.GetDirectoryName(entryAsm));
+
+            var deduped = candidates.Distinct().ToList();
+            var found = deduped.FirstOrDefault(d => File.Exists(Path.Combine(d, "chromium.br")));
+
+            if (found == null)
+                throw new ChromiumExtractionException(
+                    "Could not find chromium.br in any candidate directory: " +
+                    string.Join(", ", deduped));
+
+            return found;
         }
 
         private void SetEnvironmentVariables()
@@ -144,9 +210,9 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
             }
         }
 
-        private void ExtractDependencies(string fileName, string path)
+        private void ExtractDependencies(string fileName, string path, string sourceDirectory)
         {
-            var compressedFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, fileName);
+            var compressedFile = Path.Combine(sourceDirectory, fileName);
 
             logger.LogDebug($"Found compressed file {compressedFile}");
             using (var stream = new MemoryStream())
