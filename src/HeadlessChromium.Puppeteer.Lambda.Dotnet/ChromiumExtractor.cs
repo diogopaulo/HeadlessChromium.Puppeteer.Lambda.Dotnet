@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging;
 using Mono.Unix;
 using System;
 using System.Collections.Generic;
@@ -18,6 +18,10 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
         private static string LdLibValue = "/tmp/lib";
 
         private readonly string _chromiumPath;
+
+        // F3: Restore public accessor to preserve source and binary API compatibility.
+        public string ChromiumPath => _chromiumPath;
+        public static string DefaultChromiumPath => "/tmp/chromium";
 
         private static readonly object SyncObject = new object();
         private readonly ILogger<ChromiumExtractor> logger;
@@ -65,7 +69,7 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
         private string ResolveChromiumPath()
         {
             var envPath = Environment.GetEnvironmentVariable("CHROMIUM_PATH");
-            return !string.IsNullOrEmpty(envPath) ? envPath : "/tmp/chromium";
+            return !string.IsNullOrEmpty(envPath) ? envPath : DefaultChromiumPath;
         }
 
         /// <summary>
@@ -81,75 +85,97 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
                 logger.LogDebug("/tmp doesn't exist.  Is this running on lambda?");
             }
 
+            // F1: Fast path outside the lock is read-only (no delete). Any mutating recovery
+            // happens inside the lock so it can't race with the extraction writer.
             if (File.Exists(_chromiumPath))
             {
-                try
-                {
-                    ValidateBinary(_chromiumPath);
-                    return _chromiumPath;
-                }
-                catch (ChromiumExtractionException ex)
-                {
-                    logger.LogWarning(
-                        "Cached Chromium binary failed validation ({Message}). Re-extracting.",
-                        ex.Message);
-                    File.Delete(_chromiumPath);
-                }
+                try { ValidateBinary(_chromiumPath); return _chromiumPath; }
+                catch (ChromiumExtractionException) { /* fall through to lock */ }
             }
 
             logger.LogDebug("Chromium doesn't exist, extracting");
 
             lock (SyncObject)
             {
-                if (!File.Exists(_chromiumPath))
+                // F1: Re-check inside the lock; another thread may have extracted while we waited.
+                if (File.Exists(_chromiumPath))
                 {
-                    var sourceDirectory = FindSourceDirectory();
-
-                    if (!string.IsNullOrEmpty(AwsOperatingSystem))
+                    try
                     {
-                        ExtractDependencies($"{AwsOperatingSystem}.tar.br", "/tmp", sourceDirectory);
+                        ValidateBinary(_chromiumPath);
+                        return _chromiumPath;
                     }
-                    else
+                    catch (ChromiumExtractionException ex)
                     {
-                        logger.LogWarning("Operating environment unexpected. Unable to extract correct dependencies.");
-                    }
-
-                    ExtractDependencies("fonts.tar.br", "/tmp", sourceDirectory);
-                    ExtractDependencies("swiftshader.tar.br", "/tmp", sourceDirectory);
-
-                    var compressedFile = Path.Combine(sourceDirectory, "chromium.br");
-
-                    logger.LogDebug($"Found compressed file {compressedFile}");
-
-                    using (var writeFile = File.OpenWrite(_chromiumPath))
-                    using (var readFile = File.OpenRead(compressedFile))
-                    {
-                        logger.LogDebug($"Extracting chromium to {_chromiumPath}");
-
-                        using (var bs = new BrotliStream(readFile, CompressionMode.Decompress))
+                        // F11: Pass the exception object so the full chain is preserved in logs.
+                        logger.LogWarning(ex, "Cached Chromium binary failed validation. Re-extracting.");
+                        // F2: Wrap File.Delete — IOException/UnauthorizedAccessException must not
+                        // escape as an untyped exception replacing the ChromiumExtractionException contract.
+                        try { File.Delete(_chromiumPath); }
+                        catch (Exception delEx)
                         {
-                            bs.CopyTo(writeFile);
-                            bs.Dispose();
+                            throw new ChromiumExtractionException(
+                                $"Failed to delete invalid cached Chromium binary at {_chromiumPath}", delEx);
                         }
+                    }
+                }
 
-                        var fileInfo = new UnixFileInfo(_chromiumPath);
-                        fileInfo.FileAccessPermissions = FileAccessPermissions.UserReadWriteExecute |
-                                                         FileAccessPermissions.GroupReadWriteExecute;
+                var sourceDirectory = FindSourceDirectory();
+
+                if (!string.IsNullOrEmpty(AwsOperatingSystem))
+                {
+                    ExtractDependencies($"{AwsOperatingSystem}.tar.br", "/tmp", sourceDirectory);
+                }
+                else
+                {
+                    logger.LogWarning("Operating environment unexpected. Unable to extract correct dependencies.");
+                }
+
+                ExtractDependencies("fonts.tar.br", "/tmp", sourceDirectory);
+                ExtractDependencies("swiftshader.tar.br", "/tmp", sourceDirectory);
+
+                var compressedFile = Path.Combine(sourceDirectory, "chromium.br");
+
+                logger.LogDebug($"Found compressed file {compressedFile}");
+
+                using (var writeFile = File.OpenWrite(_chromiumPath))
+                using (var readFile = File.OpenRead(compressedFile))
+                {
+                    logger.LogDebug($"Extracting chromium to {_chromiumPath}");
+
+                    using (var bs = new BrotliStream(readFile, CompressionMode.Decompress))
+                    {
+                        bs.CopyTo(writeFile);
+                        bs.Dispose();
                     }
 
-                    ValidateBinary(_chromiumPath);
-                    logger.LogInformation("Extracted chromium to {ChromiumPath}", _chromiumPath);
+                    var fileInfo = new UnixFileInfo(_chromiumPath);
+                    fileInfo.FileAccessPermissions = FileAccessPermissions.UserReadWriteExecute |
+                                                     FileAccessPermissions.GroupReadWriteExecute;
                 }
+
+                // F5: If post-extraction validation fails, delete the corrupt file so the next
+                // call does not serve a stale invalid binary from the warm-start path.
+                try { ValidateBinary(_chromiumPath); }
+                catch (ChromiumExtractionException)
+                {
+                    try { File.Delete(_chromiumPath); } catch { /* best-effort */ }
+                    throw;
+                }
+
+                logger.LogInformation("Extracted chromium to {ChromiumPath}", _chromiumPath);
             }
 
             return _chromiumPath;
         }
 
-        private void ValidateBinary(string path)
+        internal void ValidateBinary(string path)
         {
+            // F10: Removed "after extraction" qualifier — this helper is called at both warm-start
+            // and post-extraction sites, so the phrase was self-contradicting at the warm-start site.
             if (!File.Exists(path))
                 throw new ChromiumExtractionException(
-                    $"Chromium binary not found after extraction: {path}");
+                    $"Chromium binary not found: {path}");
 
             if (new FileInfo(path).Length == 0)
                 throw new ChromiumExtractionException(
@@ -161,24 +187,43 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
                     $"Chromium binary is not executable: {path}");
         }
 
-        private string FindSourceDirectory()
+        // F7: Candidate-directory generation extracted to a shared helper so that the planned
+        // FindChromiumVersion method can call it with includeEnvOverride: false without duplicating
+        // the BaseDirectory / executing-assembly / entry-assembly candidate list.
+        internal IEnumerable<string> GetCandidateDirectories(bool includeEnvOverride)
         {
-            var candidates = new List<string>();
+            if (includeEnvOverride)
+            {
+                var envDir = Environment.GetEnvironmentVariable("CHROMIUM_BIN_PATH");
+                if (!string.IsNullOrEmpty(envDir)) yield return envDir;
+            }
 
-            var envDir = Environment.GetEnvironmentVariable("CHROMIUM_BIN_PATH");
-            if (!string.IsNullOrEmpty(envDir)) candidates.Add(envDir);
-
-            candidates.Add(AppDomain.CurrentDomain.BaseDirectory);
+            yield return AppDomain.CurrentDomain.BaseDirectory;
 
             var execAsm = Assembly.GetExecutingAssembly().Location;
             if (!string.IsNullOrEmpty(execAsm))
-                candidates.Add(Path.GetDirectoryName(execAsm));
+            {
+                // F6: Path.GetDirectoryName on a bare filename returns "" under PublishSingleFile —
+                // guard against that to avoid empty entries polluting the candidate list.
+                var d = Path.GetDirectoryName(execAsm);
+                if (!string.IsNullOrEmpty(d)) yield return d;
+            }
 
             var entryAsm = Assembly.GetEntryAssembly()?.Location;
             if (!string.IsNullOrEmpty(entryAsm))
-                candidates.Add(Path.GetDirectoryName(entryAsm));
+            {
+                var d = Path.GetDirectoryName(entryAsm);
+                if (!string.IsNullOrEmpty(d)) yield return d;
+            }
+        }
 
-            var deduped = candidates.Distinct().ToList();
+        internal string FindSourceDirectory()
+        {
+            var deduped = GetCandidateDirectories(includeEnvOverride: true)
+                .Distinct()
+                .Where(d => !string.IsNullOrEmpty(d))
+                .ToList();
+
             var found = deduped.FirstOrDefault(d => File.Exists(Path.Combine(d, "chromium.br")));
 
             if (found == null)
