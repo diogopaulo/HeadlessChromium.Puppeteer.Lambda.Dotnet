@@ -17,10 +17,7 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
         private static string LdLibEnvVariable = "LD_LIBRARY_PATH";
         private static string LdLibValue = "/tmp/lib";
 
-        private readonly string _chromiumPath;
-
-        // F3: Restore public accessor to preserve source and binary API compatibility.
-        public string ChromiumPath => _chromiumPath;
+        public string ChromiumPath => DefaultChromiumPath;
         public static string DefaultChromiumPath => "/tmp/chromium";
 
         private static readonly object SyncObject = new object();
@@ -63,13 +60,6 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
         {
             this.loggerFactory = loggerFactory;
             logger = loggerFactory.CreateLogger<ChromiumExtractor>();
-            _chromiumPath = ResolveChromiumPath();
-        }
-
-        private string ResolveChromiumPath()
-        {
-            var envPath = Environment.GetEnvironmentVariable("CHROMIUM_PATH");
-            return !string.IsNullOrEmpty(envPath) ? envPath : DefaultChromiumPath;
         }
 
         /// <summary>
@@ -87,9 +77,9 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
 
             // F1: Fast path outside the lock is read-only (no delete). Any mutating recovery
             // happens inside the lock so it can't race with the extraction writer.
-            if (File.Exists(_chromiumPath))
+            if (File.Exists(DefaultChromiumPath))
             {
-                try { ValidateBinary(_chromiumPath); return _chromiumPath; }
+                try { ValidateBinary(DefaultChromiumPath); return DefaultChromiumPath; }
                 catch (ChromiumExtractionException) { /* fall through to lock */ }
             }
 
@@ -98,12 +88,12 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
             lock (SyncObject)
             {
                 // F1: Re-check inside the lock; another thread may have extracted while we waited.
-                if (File.Exists(_chromiumPath))
+                if (File.Exists(DefaultChromiumPath))
                 {
                     try
                     {
-                        ValidateBinary(_chromiumPath);
-                        return _chromiumPath;
+                        ValidateBinary(DefaultChromiumPath);
+                        return DefaultChromiumPath;
                     }
                     catch (ChromiumExtractionException ex)
                     {
@@ -111,11 +101,11 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
                         logger.LogWarning(ex, "Cached Chromium binary failed validation. Re-extracting.");
                         // F2: Wrap File.Delete — IOException/UnauthorizedAccessException must not
                         // escape as an untyped exception replacing the ChromiumExtractionException contract.
-                        try { File.Delete(_chromiumPath); }
+                        try { File.Delete(DefaultChromiumPath); }
                         catch (Exception delEx)
                         {
                             throw new ChromiumExtractionException(
-                                $"Failed to delete invalid cached Chromium binary at {_chromiumPath}", delEx);
+                                $"Failed to delete invalid cached Chromium binary at {DefaultChromiumPath}", delEx);
                         }
                     }
                 }
@@ -138,10 +128,10 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
 
                 logger.LogDebug($"Found compressed file {compressedFile}");
 
-                using (var writeFile = File.OpenWrite(_chromiumPath))
+                using (var writeFile = File.OpenWrite(DefaultChromiumPath))
                 using (var readFile = File.OpenRead(compressedFile))
                 {
-                    logger.LogDebug($"Extracting chromium to {_chromiumPath}");
+                    logger.LogDebug($"Extracting chromium to {DefaultChromiumPath}");
 
                     using (var bs = new BrotliStream(readFile, CompressionMode.Decompress))
                     {
@@ -149,24 +139,24 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
                         bs.Dispose();
                     }
 
-                    var fileInfo = new UnixFileInfo(_chromiumPath);
+                    var fileInfo = new UnixFileInfo(DefaultChromiumPath);
                     fileInfo.FileAccessPermissions = FileAccessPermissions.UserReadWriteExecute |
                                                      FileAccessPermissions.GroupReadWriteExecute;
                 }
 
                 // F5: If post-extraction validation fails, delete the corrupt file so the next
                 // call does not serve a stale invalid binary from the warm-start path.
-                try { ValidateBinary(_chromiumPath); }
+                try { ValidateBinary(DefaultChromiumPath); }
                 catch (ChromiumExtractionException)
                 {
-                    try { File.Delete(_chromiumPath); } catch { /* best-effort */ }
+                    try { File.Delete(DefaultChromiumPath); } catch { /* best-effort */ }
                     throw;
                 }
 
-                logger.LogInformation("Extracted chromium to {ChromiumPath}", _chromiumPath);
+                logger.LogInformation("Extracted chromium to {ChromiumPath}", DefaultChromiumPath);
             }
 
-            return _chromiumPath;
+            return DefaultChromiumPath;
         }
 
         internal void ValidateBinary(string path)
@@ -187,17 +177,8 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
                     $"Chromium binary is not executable: {path}");
         }
 
-        // F7: Candidate-directory generation extracted to a shared helper so that the planned
-        // FindChromiumVersion method can call it with includeEnvOverride: false without duplicating
-        // the BaseDirectory / executing-assembly / entry-assembly candidate list.
-        internal IEnumerable<string> GetCandidateDirectories(bool includeEnvOverride)
+        internal IEnumerable<string> GetCandidateDirectories()
         {
-            if (includeEnvOverride)
-            {
-                var envDir = Environment.GetEnvironmentVariable("CHROMIUM_BIN_PATH");
-                if (!string.IsNullOrEmpty(envDir)) yield return envDir;
-            }
-
             yield return AppDomain.CurrentDomain.BaseDirectory;
 
             var execAsm = Assembly.GetExecutingAssembly().Location;
@@ -219,7 +200,7 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
 
         internal string FindSourceDirectory()
         {
-            var deduped = GetCandidateDirectories(includeEnvOverride: true)
+            var deduped = GetCandidateDirectories()
                 .Distinct()
                 .Where(d => !string.IsNullOrEmpty(d))
                 .ToList();
