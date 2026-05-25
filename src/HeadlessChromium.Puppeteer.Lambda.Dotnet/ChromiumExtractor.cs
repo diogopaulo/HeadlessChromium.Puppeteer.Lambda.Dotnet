@@ -75,8 +75,6 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
                 logger.LogDebug("/tmp doesn't exist.  Is this running on lambda?");
             }
 
-            // F1: Fast path outside the lock is read-only (no delete). Any mutating recovery
-            // happens inside the lock so it can't race with the extraction writer.
             if (File.Exists(DefaultChromiumPath))
             {
                 try { ValidateBinary(DefaultChromiumPath); return DefaultChromiumPath; }
@@ -87,29 +85,6 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
 
             lock (SyncObject)
             {
-                // F1: Re-check inside the lock; another thread may have extracted while we waited.
-                if (File.Exists(DefaultChromiumPath))
-                {
-                    try
-                    {
-                        ValidateBinary(DefaultChromiumPath);
-                        return DefaultChromiumPath;
-                    }
-                    catch (ChromiumExtractionException ex)
-                    {
-                        // F11: Pass the exception object so the full chain is preserved in logs.
-                        logger.LogWarning(ex, "Cached Chromium binary failed validation. Re-extracting.");
-                        // F2: Wrap File.Delete — IOException/UnauthorizedAccessException must not
-                        // escape as an untyped exception replacing the ChromiumExtractionException contract.
-                        try { File.Delete(DefaultChromiumPath); }
-                        catch (Exception delEx)
-                        {
-                            throw new ChromiumExtractionException(
-                                $"Failed to delete invalid cached Chromium binary at {DefaultChromiumPath}", delEx);
-                        }
-                    }
-                }
-
                 var sourceDirectory = FindSourceDirectory();
 
                 if (!string.IsNullOrEmpty(AwsOperatingSystem))
@@ -144,15 +119,6 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
                                                      FileAccessPermissions.GroupReadWriteExecute;
                 }
 
-                // F5: If post-extraction validation fails, delete the corrupt file so the next
-                // call does not serve a stale invalid binary from the warm-start path.
-                try { ValidateBinary(DefaultChromiumPath); }
-                catch (ChromiumExtractionException)
-                {
-                    try { File.Delete(DefaultChromiumPath); } catch { /* best-effort */ }
-                    throw;
-                }
-
                 logger.LogInformation("Extracted chromium to {ChromiumPath}", DefaultChromiumPath);
             }
 
@@ -161,8 +127,6 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
 
         internal void ValidateBinary(string path)
         {
-            // F10: Removed "after extraction" qualifier — this helper is called at both warm-start
-            // and post-extraction sites, so the phrase was self-contradicting at the warm-start site.
             if (!File.Exists(path))
                 throw new ChromiumExtractionException(
                     $"Chromium binary not found: {path}");
