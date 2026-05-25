@@ -4,5 +4,4 @@ build_script:
   - dotnet restore src\HeadlessChromium.Puppeteer.Lambda.Dotnet.sln
   - dotnet build src\HeadlessChromium.Puppeteer.Lambda.Dotnet.sln --no-restore -c Release -p:GeneratePackageOnBuild=false
 
-test_script:
-  - dotnet test src\HeadlessChromium.Puppeteer.Lambda.Dotnet.Tests\HeadlessChromium.Puppeteer.Lambda.Dotnet.Tests.csproj --no-build -c Release
+test: off

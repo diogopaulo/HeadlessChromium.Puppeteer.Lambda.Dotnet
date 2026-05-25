@@ -148,8 +148,6 @@ namespace HeadlessChromium.Puppeteer.Lambda.Dotnet
             var execAsm = Assembly.GetExecutingAssembly().Location;
             if (!string.IsNullOrEmpty(execAsm))
             {
-                // F6: Path.GetDirectoryName on a bare filename returns "" under PublishSingleFile —
-                // guard against that to avoid empty entries polluting the candidate list.
                 var d = Path.GetDirectoryName(execAsm);
                 if (!string.IsNullOrEmpty(d)) yield return d;
             }
